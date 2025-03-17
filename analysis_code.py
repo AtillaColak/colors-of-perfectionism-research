@@ -2,7 +2,9 @@ import cv2
 import numpy as np
 import apriltag
 from matplotlib import pyplot as plt 
-
+import os
+import glob 
+import csv
 
 def align_and_overlay(template_path, scan_path, output_path, alpha=0.5):
     # load the images
@@ -38,8 +40,8 @@ def align_and_overlay(template_path, scan_path, output_path, alpha=0.5):
     print("Number of AprilTags in scan:", len(scan_tags))
 
     if len(template_tags) < 4 or len(scan_tags) < 4:
-        print("Not enough AprilTags detected in one of the images.")
-        return
+        print("Not enough AprilTags detected in one of the images. Skipping this scan.")
+        return False  # Indicate failure to detect enough tags
 
     # For each image, we only use the first 4 tags 
     template_points = []
@@ -109,6 +111,7 @@ def align_and_overlay(template_path, scan_path, output_path, alpha=0.5):
     # save result
     cv2.imwrite(output_path, overlay)
     print(f"Aligned and overlaid image saved to {output_path}")
+    return True  # Indicate success
 
 def create_processing_mask(height, width):
     """Create a mask that excludes the corner regions where AprilTags are located."""
@@ -221,7 +224,7 @@ def analyze_color_region(region_hsv, region_mask, hue_tolerance=8,
     overflow_mask = np.zeros_like(region_mask, dtype=np.uint8)
 
     if total_pixels == 0:
-        return {"total": 0, "black": 0, "white": 0, "colored": 0,
+        return {"black": 0, "white": 0, "colored": 0,
                 "correct": 0, "overflow": 0, "dominant_hue": None,
                 "correct_mask": correct_mask, "overflow_mask": overflow_mask}
 
@@ -235,167 +238,97 @@ def analyze_color_region(region_hsv, region_mask, hue_tolerance=8,
 
     # -------------------------------
     # 2. Compute inner and border masks via distance transform.
-    #    (Here we remove the outer ~2% of the region.)
     # -------------------------------
     region_mask_bin = (region_mask == 255).astype(np.uint8)
     d = cv2.distanceTransform(region_mask_bin, cv2.DIST_L2, 5)
     max_d = d.max() if d.max() > 0 else 0
     inner_mask = np.zeros_like(region_mask)
     if max_d > 0:
-        inner_mask[d > (0.05 * max_d)] = 255  # Using ~2% threshold.
+        inner_mask[d > (0.05 * max_d)] = 255  # Exclude the outer ~5% of the region.
     border_mask = cv2.subtract(region_mask, inner_mask)
 
     # -------------------------------
-    # 3. Pre‐classify border pixels as overflow if they are "near‐black"
-    #    (i.e. S and V are very low, though not strictly black).
-    # -------------------------------
-    BORDER_MARGIN = 45  # Adjust as needed.
-    border_y, border_x = np.where(border_mask == 255)
-    for i in range(len(border_y)):
-        y, x = border_y[i], border_x[i]
-        # region_hsv is assumed to have channels [H, S, V].
-        h, s, v = region_hsv[y, x]
-        if (s <= BLACK_SATURATION_THRESHOLD + BORDER_MARGIN) and (v <= BLACK_VALUE_THRESHOLD + BORDER_MARGIN):
-            # If not strictly black, mark this border pixel as overflow.
-            if not (v < BLACK_VALUE_THRESHOLD and s < BLACK_SATURATION_THRESHOLD):
-                overflow_mask[y, x] = 255
-
-    # -------------------------------
-    # 4. Identify colored pixels (from the full region)
-    # -------------------------------
-    colored_bool = (region_pixels[:, 1] >= MIN_COLOR_SATURATION) & (region_pixels[:, 2] >= MIN_COLOR_VALUE)
-    colored_pixels = region_pixels[colored_bool]
-    count_colored = colored_pixels.shape[0]
-
-    if count_colored == 0:
-        dominant_hue = None
-        correct = 0
-        overflow = cv2.countNonZero(overflow_mask)
-        return {"total": int(total_pixels),
-                "black": int(black),
-                "white": int(white),
-                "colored": int(count_colored),
-                "correct": int(correct),
-                "overflow": int(overflow),
-                "dominant_hue": dominant_hue,
-                "correct_mask": correct_mask,
-                "overflow_mask": overflow_mask}
-
-    # -------------------------------
-    # 5. Compute dominant hue from colored pixels in the inner region.
-    #    If the inner region has no colored pixels, we assume the region is unpainted
-    #    and mark all colored pixels as overflow.
+    # 3. Compute dominant hue from colored pixels in the inner region.
     # -------------------------------
     inner_pixels = region_hsv[inner_mask == 255]
-    if inner_pixels.size > 0:
-        colored_bool_inner = (inner_pixels[:, 1] >= MIN_COLOR_SATURATION) & (inner_pixels[:, 2] >= MIN_COLOR_VALUE)
-        colored_pixels_inner = inner_pixels[colored_bool_inner]
-        if colored_pixels_inner.size == 0:
-            # Fallback: inner region has no colored pixels.
-            dominant_hue = None
-            correct = 0
-            ys_all, xs_all = np.where(region_mask == 255)
-            region_hsv_pixels = region_hsv[ys_all, xs_all]
-            is_colored_all = ((region_hsv_pixels[:, 1] >= MIN_COLOR_SATURATION) &
-                              (region_hsv_pixels[:, 2] >= MIN_COLOR_VALUE))
-            overflow_mask[ys_all[is_colored_all], xs_all[is_colored_all]] = 255
-            overflow = int(np.sum(is_colored_all))
-            return {"total": int(total_pixels),
-                    "black": int(black),
-                    "white": int(white),
-                    "colored": int(count_colored),
-                    "correct": int(correct),
-                    "overflow": int(overflow),
-                    "dominant_hue": dominant_hue,
-                    "correct_mask": correct_mask,
-                    "overflow_mask": overflow_mask}
-        else:
-            hues = colored_pixels_inner[:, 0].astype(np.uint8)
-            hist = np.bincount(hues, minlength=181)
-            dominant_hue = int(np.argmax(hist))
-    else:
-        # If inner_mask is completely empty, mark all colored pixels as overflow.
+    colored_bool_inner = (inner_pixels[:, 1] >= MIN_COLOR_SATURATION) & (inner_pixels[:, 2] >= MIN_COLOR_VALUE)
+    colored_pixels_inner = inner_pixels[colored_bool_inner]
+    if colored_pixels_inner.size == 0:
         dominant_hue = None
-        correct = 0
-        ys_all, xs_all = np.where(region_mask == 255)
-        region_hsv_pixels = region_hsv[ys_all, xs_all]
-        is_colored_all = ((region_hsv_pixels[:, 1] >= MIN_COLOR_SATURATION) &
-                          (region_hsv_pixels[:, 2] >= MIN_COLOR_VALUE))
-        overflow_mask[ys_all[is_colored_all], xs_all[is_colored_all]] = 255
-        overflow = int(np.sum(is_colored_all))
-        return {"total": int(total_pixels),
-                "black": int(black),
-                "white": int(white),
-                "colored": int(count_colored),
-                "correct": int(correct),
-                "overflow": int(overflow),
-                "dominant_hue": dominant_hue,
-                "correct_mask": correct_mask,
-                "overflow_mask": overflow_mask}
+    else:
+        hues = colored_pixels_inner[:, 0].astype(np.uint8)
+        hist = np.bincount(hues, minlength=181)
+        dominant_hue = int(np.argmax(hist))
 
     # -------------------------------
-    # 6. Classify all colored pixels in the full region based on their hue difference.
+    # 4. Classify colored pixels in the full region.
     # -------------------------------
     ys, xs = np.where(region_mask == 255)
     region_hsv_pixels = region_hsv[ys, xs]  # shape (N, 3)
     is_colored = ((region_hsv_pixels[:, 1] >= MIN_COLOR_SATURATION) &
                   (region_hsv_pixels[:, 2] >= MIN_COLOR_VALUE))
     pixel_hues = region_hsv_pixels[:, 0].astype(np.int32)
-    # Compute circular hue difference:
-    diff = np.minimum(np.abs(pixel_hues - dominant_hue),
-                      180 - np.abs(pixel_hues - dominant_hue))
+    # Compute circular hue difference (if dominant_hue is defined)
+    if dominant_hue is not None:
+        diff = np.minimum(np.abs(pixel_hues - dominant_hue),
+                          180 - np.abs(pixel_hues - dominant_hue))
+    else:
+        diff = np.full(pixel_hues.shape, 180)  # If no dominant hue, none can be "correct"
+    
+    # Basic classification based on hue difference.
     is_correct = (diff <= hue_tolerance) & is_colored
     is_overflow = (diff > hue_tolerance) & is_colored
 
+    # Now, every colored pixel is assigned either as correct or overflow.
     correct = int(np.sum(is_correct))
     overflow = int(np.sum(is_overflow))
+    # Force the colored count to be the sum of these two.
+    colored_final = correct + overflow
 
+    # Set the final masks.
     correct_mask[ys[is_correct], xs[is_correct]] = 255
     overflow_mask[ys[is_overflow], xs[is_overflow]] = 255
 
     # -------------------------------
-    # NEW CONDITION: Check if the dominant hue covers at least 15% of the region.
-    # If not, mark all colored pixels as overflow.
+    # 5. Check if the dominant hue covers at least 15% of the region.
     # -------------------------------
     if total_pixels > 0 and correct < 0.15 * total_pixels:
         correct = 0
-        # Clear the correct_mask since we are not accepting any as "correct"
         correct_mask[:] = 0
-        # Mark all colored pixels (in the region) as overflow.
-        ys_all, xs_all = np.where(region_mask == 255)
-        region_hsv_pixels_all = region_hsv[ys_all, xs_all]
-        is_colored_all = ((region_hsv_pixels_all[:, 1] >= MIN_COLOR_SATURATION) &
-                          (region_hsv_pixels_all[:, 2] >= MIN_COLOR_VALUE))
+        # Mark all colored pixels as overflow.
+        is_colored_all = ((region_hsv_pixels[:, 1] >= MIN_COLOR_SATURATION) &
+                          (region_hsv_pixels[:, 2] >= MIN_COLOR_VALUE))
         overflow_mask = np.zeros_like(region_mask, dtype=np.uint8)
-        overflow_mask[ys_all[is_colored_all], xs_all[is_colored_all]] = 255
+        overflow_mask[ys[is_colored_all], xs[is_colored_all]] = 255
         overflow = int(np.sum(is_colored_all))
+        colored_final = overflow  # since correct becomes zero
 
     # -------------------------------
-    # 7. (Optional) If the painted area is very small (< 8% of the region),
+    # 6. If the painted area is very small (< 8% of the region),
     #    then treat all colored pixels as overflow.
     # -------------------------------
-    if total_pixels > 0 and (count_colored / total_pixels) < 0.08:
+    if total_pixels > 0 and (colored_final / total_pixels) < 0.08:
         correct = 0
         correct_mask[:] = 0
+        is_colored_all = ((region_hsv_pixels[:, 1] >= MIN_COLOR_SATURATION) &
+                          (region_hsv_pixels[:, 2] >= MIN_COLOR_VALUE))
         overflow_mask = np.zeros_like(region_mask, dtype=np.uint8)
-        ys_all, xs_all = np.where(region_mask == 255)
-        all_pixels = region_hsv[ys_all, xs_all]
-        is_colored_all = ((all_pixels[:, 1] >= MIN_COLOR_SATURATION) &
-                          (all_pixels[:, 2] >= MIN_COLOR_VALUE))
-        overflow_mask[ys_all[is_colored_all], xs_all[is_colored_all]] = 255
+        overflow_mask[ys[is_colored_all], xs[is_colored_all]] = 255
         overflow = int(np.sum(is_colored_all))
+        colored_final = overflow
 
-    return {"total": int(total_pixels),
-            "black": int(black),
-            "white": int(white),
-            "colored": int(count_colored),
-            "correct": int(correct),
-            "overflow": int(overflow),
-            "dominant_hue": dominant_hue,
-            "correct_mask": correct_mask,
-            "overflow_mask": overflow_mask}
+    return {
+        "black": int(black),
+        "white": int(white),
+        "colored": int(colored_final), 
+        "correct": int(correct),
+        "overflow": int(overflow),
+        "dominant_hue": dominant_hue,
+        "correct_mask": correct_mask,
+        "overflow_mask": overflow_mask
+    }
 
-def analyze_regions(template_path, aligned_scan_path, output_visualization_path, debug=True):
+def analyze_regions(template_path, aligned_scan_path, output_visualization_path, debug=False):
     """
     Analyzes mandala regions defined by contours in the template image.
     For each unique region, the aligned scan (in HSV) is used to compute:
@@ -428,11 +361,10 @@ def analyze_regions(template_path, aligned_scan_path, output_visualization_path,
     WHITE_VALUE_THRESHOLD = 170
     WHITE_SATURATION_THRESHOLD = 48
     MIN_COLOR_SATURATION = 48
-    MIN_COLOR_VALUE = 45
+    MIN_COLOR_VALUE = 35
     hue_tolerance = 10
 
     # Global accumulators for overall statistics
-    total_pixels = 0
     total_black = 0
     total_white = 0
     total_colored = 0
@@ -468,7 +400,6 @@ def analyze_regions(template_path, aligned_scan_path, output_visualization_path,
                                      MIN_COLOR_VALUE=MIN_COLOR_VALUE)
         
         # Accumulate statistics from this region.
-        total_pixels += stats["total"]
         total_black += stats["black"]
         total_white += stats["white"]
         total_colored += stats["colored"]
@@ -491,53 +422,82 @@ def analyze_regions(template_path, aligned_scan_path, output_visualization_path,
             cX, cY = 0, 0
         cv2.putText(debug_vis, f"R{idx}", (cX - 20, cY),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        
-        region_pct = (stats["colored"] + stats["overflow"]) / stats["total"] * 100 if stats["total"] else 0
+        total_pixels = total_black + total_white + total_colored
+        region_pct = (stats["colored"] + stats["overflow"]) / total_pixels * 100 if total_pixels > 0 else 0
         overflow_pct = (stats["overflow"] / stats["colored"] * 100) if stats["colored"] else 0
         if debug:
-            print(f"Region {idx}: Total={stats['total']} pixels, "
+            print(f"Region {idx}: "
                   f"Black={stats['black']}, White={stats['white']}, "
                   f"Colored={stats['colored']} (Correct: {stats['correct']}, Overflow: {stats['overflow']}), "
                   f"Dominant Hue={stats['dominant_hue']}, "
                   f"Painted Area={region_pct:.1f}%, Overflow Ratio={overflow_pct:.1f}%")
 
+    total_pixels = total_black + total_white + total_colored
     overall_coverage_pct = (total_correct / total_pixels * 100) if total_pixels else 0
     overall_overflow_pct = (total_overflow / total_pixels * 100) if total_pixels else 0
 
-    if debug:
-        print("\nOverall Mandala Analysis:")
-        print(f"  Total Mandala Area (pixels): {total_pixels}")
-        print(f"  Total Black Pixels: {total_black}")
-        print(f"  Total White Pixels: {total_white}")
-        print(f"  Total Colored Pixels: {total_colored}")
-        print(f"    - Correctly colored: {total_correct}")
-        print(f"    - Overflow: {total_overflow}")
-        print(f"  Overall Coverage (Correct Color) Percentage: {overall_coverage_pct:.2f}%")
-        print(f"  Overall Overflow Percentage: {overall_overflow_pct:.2f}%")
-
     cv2.imwrite(output_visualization_path, debug_vis)
     print(f"Visualization saved to {output_visualization_path}")
+    return {
+        "Total Black Pixels": total_black,
+        "Total White Pixels": total_white,
+        "Total Colored Pixels": total_colored,
+        "Correct Colored Pixels": total_correct,
+        "Overflow Pixels": total_overflow,
+        "Overall Coverage (%)": overall_coverage_pct,
+        "Overall Overflow (%)": overall_overflow_pct
+    }
 
 def main():
     template_path = "mandala_with_apriltags.png"
-    scan_path = "40110.jpg"
-    aligned_output_path = "aligned_scan.png"
-    visualization_output_path = f"{scan_path[0:5]}_debug.png"
-    
-    # unblended version for analysis
-    align_and_overlay(template_path, scan_path, "aligned_scan_analysis.png", alpha=0.0)
-    
-    # Create a separate blended version for display/debug
-    align_and_overlay(template_path, scan_path, aligned_output_path, alpha=0.7)
-    
-    # analyze regions using the unblended aligned scan
-    analyze_regions(template_path, "aligned_scan_analysis.png", visualization_output_path, debug=True)
+    scan_folder = "scans"   # Folder where all scan images are stored.
+    debug_folder = "debugs" # Folder where debug images will be saved.
+    csv_output_path = "results.csv"
+
+    # Ensure the debug folder exists.
+    if not os.path.exists(debug_folder):
+        os.makedirs(debug_folder)
+
+    # Get all image paths from the scans folder.
+    scan_paths = glob.glob(os.path.join(scan_folder, "*.*"))
+
+    for scan_path in scan_paths:
+        # Get the base name of the scan file (without folder and extension)
+        base = os.path.splitext(os.path.basename(scan_path))[0]
+        
+        # Define output file names based on the base name.
+        aligned_analysis_path = base + "_analysis.png"  # unblended aligned image
+        aligned_blended_path = base + "_aligned.png"      # blended version for display
+        visualization_output_path = os.path.join(debug_folder, base + "_debug.png")  # debug visualization
+        
+        print(f"\nProcessing scan: {scan_path}")
+
+        # Create the unblended version for analysis.
+        status = align_and_overlay(template_path, scan_path, aligned_analysis_path, alpha=0.0)
+        if not status:
+            print("Skipping scan due to insufficient AprilTags.\n")
+            continue  # Skip this scan if alignment failed due to insufficient AprilTags.
+        
+        # Create the blended version for display/debug.
+        align_and_overlay(template_path, scan_path, aligned_blended_path, alpha=0.7)
+        
+        # Analyze regions using the unblended aligned scan.
+        stats = analyze_regions(template_path, aligned_analysis_path, visualization_output_path)
+        # Add the scan file path to the stats.
+        stats["id"] = scan_path
+
+        # Update the CSV file after each scan.
+        file_exists = os.path.isfile(csv_output_path)
+        with open(csv_output_path, 'a', newline='') as csvfile:
+            fieldnames = list(stats.keys())
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            # Write header if file does not exist or is empty.
+            if not file_exists or os.path.getsize(csv_output_path) == 0:
+                writer.writeheader()
+            writer.writerow(stats)
+        print(f"Updated CSV with results for {scan_path}.")
+
+    print(f"\nProcessing complete. Results saved to {csv_output_path}.")
     
 if __name__ == "__main__":
     main()
-
-
-# TODO: 
-# 1) It should detect more colors better saturation. 
-# 2) noise fixing -> sometimes there are few pixels identiified as colored/overflow in random parts of the mandala even thouhg there is no color near those pixels at all. so these are clearly error and should be ignored in the result.
-# 3) I'll IGNORE FOR NOW: maybe later -> include the checking of black circles thing. 
